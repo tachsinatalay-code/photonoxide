@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/tachsin/photonoxide/compare/v0.4.0...v0.4.1) - 2026-10-03
+
+### <!-- 4 -->Documentation
+
+- 0.4.0 is released, and 0.4.1's preconditioner is next ([#93](https://github.com/tachsin/photonoxide/pull/93))
+
 ## [0.4.0](https://github.com/tachsin/photonoxide/compare/v0.3.3...v0.4.0) - 2026-10-03
 
 ### Breaking
