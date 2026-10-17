@@ -30,7 +30,17 @@ pub enum QmrRun {
     Broken(Vec<c64>, Vec<f64>, f64),
 }
 
-/// A backend that runs QMR.
+/// What a library's own solver is preconditioned by ([`IterativeSolver::solve`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnPreconditioner {
+    /// Nothing.
+    None,
+    /// The library's own ILU(0) of the matrix.
+    Ilu0,
+}
+
+/// A backend that runs photonoxide's QMR and GMRES on its kernels, or solves by a method of
+/// its own ([`IterativeSolver::solve`]).
 pub trait IterativeSolver: Send + Sync {
     /// What it is and can do ([`Capabilities::symmetric`]: it runs the complex symmetric QMR).
     fn capabilities(&self) -> Capabilities;
@@ -63,6 +73,37 @@ pub trait IterativeSolver: Send + Sync {
         let _ = (matrix, ilu, b, stopping);
         Err(invalid(format!(
             "{} doesn't run QMR with ILU(0)",
+            self.capabilities().name
+        )))
+    }
+
+    /// The library's own solver, in words ("GMRES(40)"), if it has one: then
+    /// [`IterativeSolver::solve`] is what a solve without multigrid calls, in place of
+    /// photonoxide's QMR on the library's kernels. By default, none.
+    fn own_solver(&self) -> Option<String> {
+        None
+    }
+
+    /// A x = b from x₀ = 0 by the library's own method, to `stopping`'s relative residual
+    /// ‖b − A x‖ / ‖b‖ within its iterations: the solution, and how it went as the library
+    /// tells it (its iterations, and its residual after each as the history). photonoxide
+    /// computes the true residual of what comes back itself, and refuses a solution above the
+    /// tolerance.
+    ///
+    /// # Errors
+    ///
+    /// The backend's, and [`crate::Error::InvalidValue`] if the tolerance isn't reached within
+    /// the iterations allowed; by default, that the backend has no solver of its own.
+    fn solve(
+        &self,
+        matrix: RowMatrix<'_>,
+        preconditioner: OwnPreconditioner,
+        b: &[c64],
+        stopping: Stopping,
+    ) -> Result<(Vec<c64>, Convergence)> {
+        let _ = (matrix, preconditioner, b, stopping);
+        Err(invalid(format!(
+            "{} has no solver of its own",
             self.capabilities().name
         )))
     }

@@ -7,7 +7,7 @@ use num_complex::Complex64 as c64;
 use super::matrix_free::MatrixFree;
 use super::multigrid::{Hierarchy, Multigrid, shifted};
 use super::{Axis, Boundaries3d, Field3d, Grid3d, Lattice, Port3d, PortMode3d, Solver3d};
-use crate::backend::{self, Choice, Form, IterativeSolver};
+use crate::backend::{self, Choice, Form, IterativeSolver, OwnPreconditioner};
 use crate::fdfd::Direction;
 use crate::fdfd::krylov::{
     BlockConvergence, Convergence, Ilu0, Sparse, Stopping, block_qmr, block_qmr_preconditioned,
@@ -453,6 +453,10 @@ impl IterativeSolver3d {
             return None;
         }
         let solver = backend::preferred_iterative()?;
+        // (a method of its own is never taken in QMR's place unasked)
+        if solver.own_solver().is_some() {
+            return None;
+        }
         let runs = match &self.preconditioner {
             Preconditioning::None => true,
             Preconditioning::Ilu(ilu) => ilu.has_factors(),
@@ -550,6 +554,25 @@ impl IterativeSolver3d {
     ) -> Result<(Vec<c64>, Convergence)> {
         self.check_backend()?;
         let runner = self.runner();
+        // a library with a method of its own solves by it, where photonoxide's QMR would
+        if let Some(solver) = runner.as_ref().filter(|s| s.own_solver().is_some()) {
+            match (&self.preconditioner, &self.similarity) {
+                (Preconditioning::Ilu(_), _) => {
+                    let (x, how) =
+                        solver.solve(self.matrix.rows(), OwnPreconditioner::Ilu0, b, stopping)?;
+                    return checked(&self.matrix, b, x, how, stopping);
+                }
+                (Preconditioning::None, None) => {
+                    let (x, how) =
+                        solver.solve(self.matrix.rows(), OwnPreconditioner::None, b, stopping)?;
+                    return checked(&self.matrix, b, x, how, stopping);
+                }
+                (Preconditioning::None, Some(s)) => {
+                    return own_similar(solver.as_ref(), &self.matrix, s, b, stopping);
+                }
+                (Preconditioning::Multigrid(_), _) => {}
+            }
+        }
         Ok(match &self.preconditioner {
             Preconditioning::Ilu(ilu) => match &runner {
                 Some(solver) => {
@@ -704,6 +727,72 @@ impl IterativeSolver3d {
 
 /// A backend's solution of A x = b, held to `stopping`'s tolerance on the residual computed
 /// here, which its convergence then reports.
+/// A x = b by a library's own solver on B = S A S⁻¹, the matrix this solver holds: B y = S b,
+/// x = S⁻¹ y, judged by A's residual as [`crate::fdfd::krylov::qmr_similar`] judges it, and
+/// solved again for the shortfall where B's tolerance was reached before A's.
+fn own_similar(
+    solver: &dyn IterativeSolver,
+    b_matrix: &Sparse,
+    s: &[c64],
+    b: &[c64],
+    stopping: Stopping,
+) -> Result<(Vec<c64>, Convergence)> {
+    let norm = |v: &[c64]| v.iter().map(|z| z.norm_sqr()).sum::<f64>().sqrt();
+    let rho0 = norm(b);
+    let c: Vec<c64> = b.iter().zip(s).map(|(x, w)| x * w).collect();
+    let scale = norm(&c);
+    let mut y = vec![c64::new(0.0, 0.0); b.len()];
+    let mut history = Vec::new();
+    let mut tolerance = stopping.tolerance;
+    for _ in 0..5 {
+        let by = b_matrix.apply(&y);
+        let rc: Vec<c64> = c.iter().zip(&by).map(|(p, q)| p - q).collect();
+        let ra: Vec<c64> = rc.iter().zip(s).map(|(r, w)| r / w).collect();
+        let residual = if rho0 == 0.0 { 0.0 } else { norm(&ra) / rho0 };
+        if residual <= stopping.tolerance {
+            return Ok((
+                y.iter().zip(s).map(|(p, w)| p / w).collect(),
+                Convergence {
+                    iterations: history.len(),
+                    residual,
+                    history,
+                },
+            ));
+        }
+        if !history.is_empty() {
+            tolerance *= 0.5 * stopping.tolerance / residual;
+        }
+        let left = norm(&rc);
+        let (dy, how) = solver.solve(
+            b_matrix.rows(),
+            OwnPreconditioner::None,
+            &rc,
+            Stopping {
+                tolerance: tolerance * scale / left,
+                max_iterations: stopping.max_iterations.saturating_sub(history.len()),
+            },
+        )?;
+        if dy.len() != y.len() {
+            return Err(Error::invalid(
+                "iterative backend",
+                format!("{} values for {} unknowns", dy.len(), y.len()),
+            ));
+        }
+        for (yk, d) in y.iter_mut().zip(&dy) {
+            *yk += d;
+        }
+        history.extend(how.history.iter().map(|h| h * left / scale));
+    }
+    Err(Error::invalid(
+        "iterative backend",
+        format!(
+            "its solver reached its tolerance on the symmetric similar matrix 5 times without \
+             A's residual reaching {:e}",
+            stopping.tolerance
+        ),
+    ))
+}
+
 fn checked(
     a: &Sparse,
     b: &[c64],

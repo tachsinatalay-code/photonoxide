@@ -22,6 +22,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod accelerate;
+pub mod aocl_sparse;
 pub mod blas;
 mod cuda;
 mod cudss;
@@ -37,6 +38,7 @@ mod smoke;
 pub mod superlu;
 
 pub use accelerate::Accelerate;
+pub use aocl_sparse::AoclSparse;
 pub use blas::Blas;
 pub use cudss::Cudss;
 pub use discovery::{Candidate, Discovery, Source, Spec, Status, discover, versioned};
@@ -92,6 +94,10 @@ pub fn register_all() -> Vec<Probe> {
     let _ = match GpuQmr::load() {
         Ok(qmr) => offer_iterative(std::sync::Arc::new(qmr)).map(drop),
         Err(reason) => photonoxide::backend::register_iterative_unavailable("cusparse", reason),
+    };
+    let _ = match AoclSparse::load() {
+        Ok(aocl) => offer_iterative(std::sync::Arc::new(aocl)).map(drop),
+        Err(reason) => photonoxide::backend::register_iterative_unavailable("aocl-sparse", reason),
     };
     let _ = match Pardiso::load() {
         Ok(pardiso) => offer(std::sync::Arc::new(pardiso)).map(drop),

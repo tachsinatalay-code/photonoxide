@@ -494,11 +494,40 @@ Jacobi and one aggregation AMG only, and its complex GMRES's Givens rotation dro
 it diverges on photonoxide's systems. [The plan](../plans/backends.md#amgx-examined-and-not-a-backend-190-2026-10-11)
 has what was read and measured.
 
+## A library's own iterative solver
+
+An iterative backend so far ran photonoxide's own recurrences on its kernels (QMR and GMRES on
+the GPU). A library may instead have a method of its own. `IterativeSolver::own_solver` names
+it, and `IterativeSolver::solve` runs it: A x = b from x₀ = 0, on the matrix by rows, with
+nothing or with the library's own ILU(0) (`OwnPreconditioner`), to the relative residual and
+within the iterations of `Stopping`.
+
+- **Where it is asked.** Where the 3D solver would run QMR, plain or with ILU(0), a backend
+  with a solver of its own, chosen by name, is asked to solve instead. With PMLs all round the
+  solver holds the symmetric similar matrix B = S A S⁻¹, and the library is given B and S b;
+  the answer is judged by A's residual, and solved again for the shortfall where B's tolerance
+  was reached first, as photonoxide's own QMR on B is.
+- **Checked every time.** photonoxide computes the true residual of what comes back and
+  refuses a solution above the tolerance, whatever the library reported.
+- **Never unasked.** `auto` doesn't take such a backend: another method in QMR's place is the
+  user's choice. It runs no multigrid.
+
+**AOCL-Sparse** (`native/src/aocl_sparse.rs`, the backend `aocl-sparse`) is the first: AMD's
+restarted GMRES on complex matrices (`aoclsparse_itsol_z_solve`), restarted every 40 steps,
+plain or with its ILU(0).
+
+- Its settings are set by name, and its matrix and handle are opaque, so no structure's layout
+  is needed.
+- It is built with 32-bit or 64-bit integers under the same names. Which, is found by asking
+  it for a 1 × 1 matrix both ways; either build is used.
+- The history is its residual after each iteration, from its monitoring callback.
+- Its threads are OpenMP's. Not declared deterministic.
+
 ## What isn't here yet
 
 The mode solvers' shift-and-invert still calls faer's LU directly. AMD's AOCL and Arm's
 Performance Libraries are loaded as dense kernels, but neither has yet run with photonoxide:
 their discovery and the interface checks are tested (the CI's test library has their
-variants), the libraries themselves wait for an AMD and an Arm machine. AMD's AOCL-Sparse as an
-iterative backend is #189; the multigrid without its finest matrix on the GPU is #337.
+variants), the libraries themselves wait for an AMD and an Arm machine. AMD's AOCL-Sparse, the iterative
+backend above, hasn't run on an AMD machine yet; the multigrid without its finest matrix on the GPU is #337.
 Eigensolvers get their own trait with their first backend.

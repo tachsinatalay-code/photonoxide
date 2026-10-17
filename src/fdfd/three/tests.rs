@@ -2061,3 +2061,173 @@ fn auto_takes_the_3d_backend_this_machines_records_say() {
         .fold(0.0, f64::max);
     assert!(off < 1e-10 * largest, "{off} of {largest}");
 }
+
+/// A backend whose own solver is exact (photonoxide's direct solve of the rows it is given),
+/// or answers with zeros: what [`IterativeSolver3d`] makes of a library's own method.
+struct OwnForTests {
+    name: &'static str,
+    right: bool,
+    asked: std::sync::Mutex<Vec<crate::backend::OwnPreconditioner>>,
+}
+
+impl crate::backend::IterativeSolver for OwnForTests {
+    fn capabilities(&self) -> crate::backend::Capabilities {
+        crate::backend::Capabilities::new(self.name, "1", "MIT OR Apache-2.0")
+    }
+
+    fn qmr_run(
+        &self,
+        _: &crate::backend::Matrix<'_>,
+        _: &[c64],
+        _: crate::fdfd::Stopping,
+    ) -> Result<crate::backend::QmrRun> {
+        Err(Error::invalid("test", "its own solver is asked, not QMR"))
+    }
+
+    fn own_solver(&self) -> Option<String> {
+        Some("a direct solve".into())
+    }
+
+    fn solve(
+        &self,
+        matrix: crate::backend::RowMatrix<'_>,
+        preconditioner: crate::backend::OwnPreconditioner,
+        b: &[c64],
+        _: crate::fdfd::Stopping,
+    ) -> Result<(Vec<c64>, crate::fdfd::Convergence)> {
+        self.asked.lock().unwrap().push(preconditioner);
+        let how = crate::fdfd::Convergence {
+            iterations: 1,
+            residual: 0.0,
+            history: vec![0.0],
+        };
+        if !self.right {
+            return Ok((vec![c64::new(0.0, 0.0); b.len()], how));
+        }
+        // the rows of A are the columns of Aᵀ
+        let transposed = crate::backend::Matrix::new(
+            matrix.rows(),
+            matrix.starts(),
+            matrix.indices(),
+            matrix.values(),
+            crate::backend::Form::General,
+        )?;
+        let direct = crate::backend::direct(&crate::backend::Choice::Photonoxide)?;
+        let factors = direct
+            .analyse(&transposed)?
+            .expect("a general matrix is analysed")
+            .factorize(&transposed)?;
+        Ok((factors.solve_transpose(b)?, how))
+    }
+}
+
+#[test]
+fn a_librarys_own_solver_is_asked_in_qmrs_place_and_its_answer_checked() {
+    use crate::backend::{Choice, OwnPreconditioner, register_iterative};
+    use crate::fdfd::{IterativeSolver3d, Multigrid, Stopping};
+    use std::sync::Arc;
+    let (n, h) = (8, 0.05);
+    let grid = Grid3d {
+        nx: n,
+        ny: n,
+        nz: n,
+        dx: h,
+        dy: h,
+        dz: h,
+        x0: -0.2,
+        y0: -0.2,
+        z0: -0.2,
+    };
+    let cube = |x: f64, y: f64, z: f64| {
+        let inside = x.abs() < 0.1 && y.abs() < 0.1 && z.abs() < 0.1;
+        c64::new(if inside { 12.0 } else { 2.0 }, 0.0)
+    };
+    let lam = Wavelength::um(1.55).unwrap();
+    let mut source = vec![c64::new(0.0, 0.0); grid.unknowns()];
+    source[grid.index(Axis::Z, (4, 4, 4))] = c64::new(1.0, 0.0);
+    let stopping = Stopping {
+        tolerance: 1e-9,
+        max_iterations: 5000,
+    };
+    let exact = Arc::new(OwnForTests {
+        name: "own-exact-for-tests",
+        right: true,
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    register_iterative(exact.clone()).unwrap();
+    register_iterative(Arc::new(OwnForTests {
+        name: "own-zeros-for-tests",
+        right: false,
+        asked: std::sync::Mutex::new(Vec::new()),
+    }))
+    .unwrap();
+    let by = |name: &str| Choice::Named(name.into());
+    let bloch = Boundaries3d {
+        x: Edges::Bloch { k: 0.8 },
+        ..Boundaries3d::pml(3)
+    };
+    // PMLs all round: the solver holds B = S A S⁻¹, and the library is given B; a Bloch side: A
+    for (name, boundaries) in [("PMLs", Boundaries3d::pml(3)), ("Bloch along x", bloch)] {
+        let new =
+            || IterativeSolver3d::new(grid, lam, cube, boundaries, Formulation::CurlCurl).unwrap();
+        let (ours, _) = new().solve(&source, stopping).unwrap();
+        let largest = ours.values().iter().map(|v| v.norm()).fold(0.0, f64::max);
+        let apart = |field: &Field3d| {
+            field
+                .values()
+                .iter()
+                .zip(ours.values())
+                .map(|(p, q)| (p - q).norm())
+                .fold(0.0, f64::max)
+                / largest
+        };
+        exact.asked.lock().unwrap().clear();
+        let solver = new()
+            .with_iterative_backend(&by("own-exact-for-tests"))
+            .unwrap();
+        let (theirs, how) = solver.solve(&source, stopping).unwrap();
+        assert!(how.residual <= 1e-9, "{name}: {how:?}");
+        assert!(apart(&theirs) < 1e-6, "{name}: {}", apart(&theirs));
+        assert_eq!(*exact.asked.lock().unwrap(), [OwnPreconditioner::None]);
+        // with ILU(0), on Shin and Fan's operator as photonoxide's needs it: the library's
+        // own ILU(0), asked for by name
+        exact.asked.lock().unwrap().clear();
+        let shin_fan = || {
+            IterativeSolver3d::new(grid, lam, cube, boundaries, Formulation::ShinFan)
+                .unwrap()
+                .with_ilu()
+                .unwrap()
+        };
+        let (ours_ilu, _) = shin_fan().solve(&source, stopping).unwrap();
+        let solver = shin_fan()
+            .with_iterative_backend(&by("own-exact-for-tests"))
+            .unwrap();
+        let (theirs, how) = solver.solve(&source, stopping).unwrap();
+        assert!(how.residual <= 1e-9, "{name}: {how:?}");
+        let d = theirs
+            .values()
+            .iter()
+            .zip(ours_ilu.values())
+            .map(|(p, q)| (p - q).norm())
+            .fold(0.0, f64::max)
+            / largest;
+        assert!(d < 1e-6, "{name}, ILU(0): {d}");
+        assert_eq!(*exact.asked.lock().unwrap(), [OwnPreconditioner::Ilu0]);
+        // an answer that doesn't solve the system is refused, whatever the library said of it
+        let wrong = new()
+            .with_iterative_backend(&by("own-zeros-for-tests"))
+            .unwrap();
+        let e = wrong.solve(&source, stopping).unwrap_err().to_string();
+        assert!(e.contains("iterative backend"), "{name}: {e}");
+        // and it runs no multigrid
+        if name == "PMLs" {
+            let refused = IterativeSolver3d::new(grid, lam, cube, boundaries, Formulation::ShinFan)
+                .unwrap()
+                .with_multigrid(Multigrid::default())
+                .unwrap()
+                .with_iterative_backend(&by("own-exact-for-tests"));
+            let e = refused.err().unwrap().to_string();
+            assert!(e.contains("multigrid"), "{e}");
+        }
+    }
+}

@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use num_complex::Complex64 as c64;
 use photonoxide::Result;
-use photonoxide::backend::{self, Choice, DirectSolver, Form, IterativeSolver, Matrix, QmrRun};
+use photonoxide::backend::{
+    self, Choice, DirectSolver, Form, IterativeSolver, Matrix, OwnPreconditioner, QmrRun, RowMatrix,
+};
 use photonoxide::fdfd::Stopping;
 
 use crate::library::error;
@@ -153,14 +155,36 @@ pub fn smoke_test_iterative(solver: &dyn IterativeSolver) -> Result<f64> {
             tolerance: 1e-12,
             max_iterations: 10 * N,
         };
-        let theirs = match solver.qmr_run(&matrix, &b, stopping)? {
-            QmrRun::Done(x, _) => x,
-            QmrRun::Broken(_, history, d) => {
+        let theirs = if solver.own_solver().is_some() {
+            // a method of its own: plain and with its ILU(0), on the matrix by rows
+            let (row_starts, columns, by_rows) = by_rows(&starts, &rows, &values);
+            let rows_of = RowMatrix::new(N, &row_starts, &columns, &by_rows)?;
+            let (plain, _) = solver.solve(rows_of, OwnPreconditioner::None, &b, stopping)?;
+            let (with_ilu, _) = solver.solve(rows_of, OwnPreconditioner::Ilu0, &b, stopping)?;
+            let apart = plain
+                .iter()
+                .zip(&with_ilu)
+                .map(|(p, q)| (p - q).norm())
+                .fold(0.0, f64::max);
+            let scale = plain.iter().map(|v| v.norm()).fold(0.0, f64::max);
+            if apart.is_nan() || apart > 1e-9 * scale {
                 return Err(error(format!(
-                    "{}'s QMR broke down at step {} (|wᵀv| = {d:e})",
+                    "{}'s solver with and without its ILU(0) differ by {:.1e}",
                     capabilities.name,
-                    history.len()
+                    apart / scale
                 )));
+            }
+            with_ilu
+        } else {
+            match solver.qmr_run(&matrix, &b, stopping)? {
+                QmrRun::Done(x, _) => x,
+                QmrRun::Broken(_, history, d) => {
+                    return Err(error(format!(
+                        "{}'s QMR broke down at step {} (|wᵀv| = {d:e})",
+                        capabilities.name,
+                        history.len()
+                    )));
+                }
             }
         };
         let general = Matrix::new(N, &starts, &rows, &values, Form::General)?;
@@ -186,6 +210,27 @@ pub fn smoke_test_iterative(solver: &dyn IterativeSolver) -> Result<f64> {
         largest = largest.max(difference);
     }
     Ok(largest)
+}
+
+/// A matrix given by columns, by rows: the row starts, each entry's column and its value, the
+/// columns ascending in each row.
+fn by_rows(starts: &[usize], rows: &[usize], values: &[c64]) -> (Vec<usize>, Vec<usize>, Vec<c64>) {
+    let n = starts.len() - 1;
+    let mut lists: Vec<Vec<(usize, c64)>> = vec![Vec::new(); n];
+    for j in 0..n {
+        for e in starts[j]..starts[j + 1] {
+            lists[rows[e]].push((j, values[e]));
+        }
+    }
+    let (mut row_starts, mut columns, mut by_rows) = (vec![0], Vec::new(), Vec::new());
+    for list in lists {
+        for (j, v) in list {
+            columns.push(j);
+            by_rows.push(v);
+        }
+        row_starts.push(columns.len());
+    }
+    (row_starts, columns, by_rows)
 }
 
 /// Registers an iterative `solver` if it passes [`smoke_test_iterative`], or its name as
